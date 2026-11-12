@@ -16,6 +16,7 @@ Only the Python standard library plus PyYAML are used.
 import base64
 import json
 import os
+import re
 import sys
 import urllib.parse
 import urllib.request
@@ -227,7 +228,100 @@ def convert_proxies(proxies):
     return links, skipped
 
 
-def build_v2ray_content(clash_text: str) -> str:
+# Extra public free-subscription projects merged into v2ray.txt.
+# (name, raw url, cap; cap=0 means take everything parseable)
+EXTRA_SOURCES = [
+    ("mahdibland", "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt", 250),
+    ("barry-far", "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/All_Configs_base64_Sub.txt", 250),
+    ("nomorewalls", "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt", 0),
+    ("pawdroid", "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub", 0),
+    ("ripaojiedian", "https://raw.githubusercontent.com/ripaojiedian/freenode/main/sub", 0),
+]
+
+ALLOWED_SCHEMES = {"ss", "vmess", "trojan", "vless", "hysteria2", "hy2", "tuic"}
+
+
+def parse_subscription(text: str):
+    lines = [ln.strip() for ln in text.splitlines() if "://" in ln]
+    valid = [ln for ln in lines if ln.split("://", 1)[0].lower() in ALLOWED_SCHEMES]
+    if len(valid) >= 3:
+        return valid
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return []
+    for alt in (None, b"-_"):
+        try:
+            dec = base64.b64decode(
+                compact + "=" * (-len(compact) % 4), altchars=alt
+            ).decode("utf8")
+        except Exception:
+            continue
+        lines = [ln.strip() for ln in dec.splitlines() if "://" in ln]
+        return [ln for ln in lines if ln.split("://", 1)[0].lower() in ALLOWED_SCHEMES]
+    return []
+
+
+def link_key(link: str):
+    try:
+        if link.startswith("vmess://"):
+            data = json.loads(base64.b64decode(link[8:].split("#", 1)[0]))
+            return ("vmess", data.get("id", ""), str(data.get("add", "")).lower(), str(data.get("port", "")))
+        u = urllib.parse.urlparse(link)
+        return (
+            u.scheme.lower(),
+            urllib.parse.unquote(u.username or ""),
+            urllib.parse.unquote(u.password or ""),
+            (u.hostname or "").lower(),
+            u.port,
+        )
+    except Exception:
+        return ("raw", link.split("#", 1)[0])
+
+
+def sample_evenly(items, cap):
+    if cap <= 0 or len(items) <= cap:
+        return items
+    n = len(items)
+    return [items[int(i * n / cap)] for i in range(cap)]
+
+
+def fetch_text(url: str) -> str:
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("User-Agent", "clash2v2ray/1.0")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return resp.read().decode("utf8", errors="replace")
+
+
+def collect_extra_links(own_links, local_files=None):
+    seen = {link_key(ln) for ln in own_links}
+    extras = []
+    for name, url, cap in EXTRA_SOURCES:
+        try:
+            if local_files and name in local_files:
+                with open(local_files[name], encoding="utf8", errors="replace") as f:
+                    text = f.read()
+            else:
+                text = fetch_text(url)
+            links = parse_subscription(text)
+            picked = sample_evenly(links, cap)
+            added = 0
+            for ln in picked:
+                key = link_key(ln)
+                if key in seen:
+                    continue
+                seen.add(key)
+                extras.append(ln)
+                added += 1
+            print(
+                f"extra[{name}]: parsed={len(links)} picked={len(picked)} added={added}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"extra[{name}] failed: {e}", flush=True)
+    return extras
+
+
+def links_from_clash(clash_text: str):
     data = yaml.safe_load(clash_text) or {}
     proxies = data.get("proxies") or []
     links, skipped = convert_proxies(proxies)
@@ -241,6 +335,14 @@ def build_v2ray_content(clash_text: str) -> str:
     )
     if not links:
         raise SystemExit("no convertible proxies found, refusing to overwrite v2ray.txt")
+    return links
+
+
+def build_v2ray_content(clash_text: str, extra_links=None) -> str:
+    links = links_from_clash(clash_text)
+    if extra_links:
+        links = links + list(extra_links)
+        print(f"total links with extras: {len(links)}", flush=True)
     body = "\n".join(links)
     return base64.b64encode(body.encode()).decode()
 
@@ -261,8 +363,16 @@ def main(argv):
     if "--input" in argv:
         i = argv.index("--input")
         o = argv.index("--output")
+        local_files = {}
+        for j, arg in enumerate(argv):
+            if arg == "--extra-file" and j + 1 < len(argv) and "=" in argv[j + 1]:
+                nm, path = argv[j + 1].split("=", 1)
+                local_files[nm] = path
         with open(argv[i + 1], encoding="utf8") as f:
-            content = build_v2ray_content(f.read())
+            clash_text = f.read()
+        own = links_from_clash(clash_text)
+        extras = collect_extra_links(own, local_files=local_files or None)
+        content = build_v2ray_content(clash_text, extra_links=extras)
         with open(argv[o + 1], "w", encoding="utf8") as f:
             f.write(content)
         print(f"wrote {argv[o + 1]}")
@@ -288,7 +398,11 @@ def main(argv):
         with urllib.request.urlopen(req, timeout=60) as resp:
             clash_text = resp.read().decode()
 
-    content = build_v2ray_content(clash_text)
+    own = links_from_clash(clash_text)
+    extras = []
+    if os.environ.get("EXTRA_SUBS", "").strip().lower() != "off":
+        extras = collect_extra_links(own)
+    content = build_v2ray_content(clash_text, extra_links=extras)
     http(
         "PATCH",
         f"{API}/gists/{gist_id}",
