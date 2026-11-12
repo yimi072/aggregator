@@ -67,5 +67,8 @@ jobs:
       - name: Refresh
         run: python -u subscribe/collect.py --all --refresh --overwrite --skip
 
+      - name: FixV2ray
+        run: python -u tools/clash2v2ray.py
+
       - name: Timestamp
         run: date
